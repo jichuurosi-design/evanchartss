@@ -1,0 +1,122 @@
+// EVANcharts · Vercel Edge Function: yt-daily-refresh
+// Archivo: /api/yt-daily-refresh.js
+
+import { neon } from "@neondatabase/serverless";
+
+const YT_CHANNEL_ID = "UCZ2HxqOVq5Hm9jjgWxCBweQ"; // @h_evva_n
+const YT_API_KEY    = process.env.YT_API_KEY;
+const DATABASE_URL  = process.env.DATABASE_URL;
+
+const VIDEO_IDS = [
+  "BXwL-cBVXDQ",  // EVAN 'Overflow' Lyric Video
+  "CsGENgLpyaw",  // EVAN 'Ride or Die' Official MV
+  "Qw3T9NBnOyc",  // EVAN - RIDE OR DIE
+  "LIEOXiEAq5E",  // EVAN 'Ride or Die' Official MV Teaser
+  "3SHd1xhjI9s",  // EVAN 'Overflow' [LIVE]
+  "sS9XGAFoRM0",  // EVAN 'Ride or Die' MV Shoot Sketch | Archiv:E
+  "h-5mI2K9jfU",  // EVAN 'Ride or Die' Dance Practice | Stag:E
+  "8tTzR8oViEg",  // EVAN 친한친구 방송반 DJ 비하인드 | Archiv:E
+  "TruS_QursBw",  // 에반 오늘 뭐 하지? | Sid:E
+  "uDCONRmyjds",  // Cover 灰色と青 | TOKYO Tap:E
+  "0U6sXMUYtRM",  // 작업실을 꾸며보는 건 처음입니다 | Sid:E
+  "V7dCFEJ1xrc",  // EVAN GLOBAL OFFICIAL FANCLUB EVER MEMBERSHIP Welcome Message
+  "TB1bu9TxJzQ",  // 공연을 위해 한강에서 부산까지 | Sid:E log
+  "yEV-DNKmwuY",  // EVAN 'Ride or Die' 챌린지 비하인드 | Archiv:E
+  "eyCjCFY_nlQ",  // EVAN 'RIDE OR DIE' 음악방송 비하인드 | Archiv:E
+  "bHELiN_9pCY",  // 'RIDE OR DIE' 활동을 마쳤습니다 | Sid:E
+  "Sy28D2DXEdQ",  // 도쿄 미니 투어 재밌다 ㅎㅎ | Sid:E log
+];
+
+export default async function handler(req, res) {
+  if (req.headers["authorization"] !== `Bearer ${process.env.CRON_SECRET}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  try {
+    const sql = neon(DATABASE_URL);
+
+    // ── 1. Stats del canal ──────────────────────────────────
+    const chRes  = await fetch(
+      `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${YT_CHANNEL_ID}&key=${YT_API_KEY}`
+    );
+    const chData = await chRes.json();
+
+    if (!chRes.ok || !chData.items?.length) {
+      return res.status(502).json({ error: "Channel API error", detail: chData });
+    }
+
+    const chStats  = chData.items[0].statistics;
+    const newSubs  = parseInt(chStats.subscriberCount) || 0;
+    const newViews = parseInt(chStats.viewCount)        || 0;
+
+    const cfg = await sql`SELECT key, value FROM site_config WHERE key IN ('yt_subs','yt_views')`;
+    const cfgMap = Object.fromEntries(cfg.map(r => [r.key, r.value]));
+
+    const prevSubs   = parseInt(cfgMap["yt_subs"]  || "0");
+    const prevViews  = parseInt(cfgMap["yt_views"] || "0");
+    const dailySubs  = prevSubs  > 0 && newSubs  >= prevSubs  ? newSubs  - prevSubs  : 0;
+    const dailyViews = prevViews > 0 && newViews >= prevViews ? newViews - prevViews : 0;
+    const lastUpdated = new Date().toISOString();
+
+    // ── 2. Stats de cada video ──────────────────────────────
+    // YouTube solo acepta 50 IDs por request — dividimos en chunks
+    const chunks = [];
+    for (let i = 0; i < VIDEO_IDS.length; i += 50) {
+      chunks.push(VIDEO_IDS.slice(i, i + 50));
+    }
+
+    const videoResults = [];
+    const snapKeys = VIDEO_IDS.map(id => `yt_snap_${id}`);
+    const snaps = await sql`SELECT key, value FROM site_config WHERE key = ANY(${snapKeys})`;
+    const snapMap = Object.fromEntries(snaps.map(r => [r.key, r.value]));
+
+    for (const chunk of chunks) {
+      const vidRes  = await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${chunk.join(",")}&key=${YT_API_KEY}`
+      );
+      const vidData = await vidRes.json();
+      if (!vidRes.ok || !vidData.items?.length) continue;
+
+      for (const item of vidData.items) {
+        const vid          = item.id;
+        const currViews    = parseInt(item.statistics?.viewCount    || "0");
+        const currLikes    = parseInt(item.statistics?.likeCount    || "0");
+        const currComments = parseInt(item.statistics?.commentCount || "0");
+        const prevSnap     = parseInt(snapMap[`yt_snap_${vid}`]    || "0");
+        const daily24h     = prevSnap > 0 && currViews >= prevSnap ? currViews - prevSnap : 0;
+
+        await sql`
+          INSERT INTO site_config (key, value) VALUES
+            (${`yt_snap_${vid}`},     ${String(currViews)}),
+            (${`yt_likes_${vid}`},    ${String(currLikes)}),
+            (${`yt_comments_${vid}`}, ${String(currComments)}),
+            (${`yt_daily24h_${vid}`}, ${String(daily24h)})
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        `;
+
+        videoResults.push({ id: vid, views: currViews, likes: currLikes, comments: currComments, daily24h });
+      }
+    }
+
+    // ── 3. Guardar stats del canal ──────────────────────────
+    await sql`
+      INSERT INTO site_config (key, value) VALUES
+        ('yt_subs',         ${String(newSubs)}),
+        ('yt_views',        ${String(newViews)}),
+        ('yt_subs_daily',   ${String(dailySubs)}),
+        ('yt_views_daily',  ${String(dailyViews)}),
+        ('yt_last_updated', ${lastUpdated})
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    `;
+
+    return res.status(200).json({
+      ok: true,
+      updated: lastUpdated,
+      channel: { subscribers: newSubs, views: newViews, daily_subs: dailySubs, daily_views: dailyViews },
+      videos: videoResults,
+    });
+
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+}
